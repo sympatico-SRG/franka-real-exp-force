@@ -15,6 +15,19 @@ from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import Float32
 from std_srvs.srv import SetBool
 
+from franka_lerobot_data_bridge.torque import (
+    TORQUE_UNIT,
+    TorqueSample,
+    make_torque_sample,
+    torque_sample_skew_wait_reason,
+    torque_sample_wait_reason,
+)
+
+try:
+    from franka_msgs.msg import FrankaRobotState
+except ModuleNotFoundError:  # pragma: no cover - depends on robot computer env
+    FrankaRobotState = None
+
 try:
     import pylibfranka
 except ModuleNotFoundError:  # pragma: no cover - depends on robot computer env
@@ -114,6 +127,11 @@ class LeRobotDataBridge(Node):
 
         self.sample_rate_hz = float(self.get_parameter("sample_rate_hz").value)
         self.max_data_age_sec = float(self.get_parameter("max_data_age_sec").value)
+        self.record_torque = bool(self.get_parameter("record_torque").value)
+        self.max_torque_age_sec = float(self.get_parameter("max_torque_age_sec").value)
+        self.max_torque_sample_skew_sec = float(
+            self.get_parameter("max_torque_sample_skew_sec").value
+        )
         self.publish_host = str(self.get_parameter("publish_host").value)
         self.publish_port = int(self.get_parameter("publish_port").value)
         self.command_host = str(self.get_parameter("command_host").value)
@@ -134,6 +152,15 @@ class LeRobotDataBridge(Node):
         )
         self.left_robot_ip = str(self.get_parameter("left_robot_ip").value)
         self.right_robot_ip = str(self.get_parameter("right_robot_ip").value)
+        if self.record_torque and self.deployment_mode:
+            raise ValueError(
+                "record_torque is supported only by the collection launch. "
+                "The deployment launch intentionally does not start franka_robot_state_broadcaster."
+            )
+        if self.record_torque and FrankaRobotState is None:
+            raise RuntimeError(
+                "record_torque=true requires franka_msgs from the configured franka_ros2 workspace."
+            )
 
         self.include_gripper = bool(self.get_parameter("include_gripper").value)
         self.include_right_arm = bool(self.get_parameter("include_right_arm").value)
@@ -146,6 +173,9 @@ class LeRobotDataBridge(Node):
 
         self.left_robot_joint_state_topic = str(
             self.get_parameter("left_robot_joint_state_topic").value
+        )
+        self.left_franka_robot_state_topic = str(
+            self.get_parameter("left_franka_robot_state_topic").value
         )
         self.left_arm_action_topic = str(self.get_parameter("left_arm_action_topic").value)
         self.left_robot_gripper_state_topic = str(
@@ -166,6 +196,9 @@ class LeRobotDataBridge(Node):
 
         self.right_robot_joint_state_topic = str(
             self.get_parameter("right_robot_joint_state_topic").value
+        )
+        self.right_franka_robot_state_topic = str(
+            self.get_parameter("right_franka_robot_state_topic").value
         )
         self.right_arm_action_topic = str(self.get_parameter("right_arm_action_topic").value)
         self.right_robot_gripper_state_topic = str(
@@ -193,6 +226,7 @@ class LeRobotDataBridge(Node):
             self.camera_topics.append(str(self.get_parameter(f"camera_{idx}_topic").value))
 
         self.latest_robot_arm_samples: dict[str, JointSample | None] = {"left": None, "right": None}
+        self.latest_torque_samples: dict[str, TorqueSample | None] = {"left": None, "right": None}
         self.latest_arm_action_samples: dict[str, JointSample | None] = {"left": None, "right": None}
         self.latest_robot_gripper_samples: dict[str, JointSample | None] = {"left": None, "right": None}
         self.latest_gripper_action_samples: dict[str, JointSample | None] = {"left": None, "right": None}
@@ -249,6 +283,9 @@ class LeRobotDataBridge(Node):
         else:
             self._create_live_state_subscriptions()
 
+        if self.record_torque:
+            self._create_torque_subscriptions()
+
         for idx, topic in enumerate(self.camera_topics):
             self.create_subscription(
                 Image,
@@ -276,6 +313,9 @@ class LeRobotDataBridge(Node):
     def _declare_parameters(self) -> None:
         self.declare_parameter("sample_rate_hz", 15.0)
         self.declare_parameter("max_data_age_sec", 0.5)
+        self.declare_parameter("record_torque", False)
+        self.declare_parameter("max_torque_age_sec", 0.1)
+        self.declare_parameter("max_torque_sample_skew_sec", 0.05)
         self.declare_parameter("publish_host", "127.0.0.1")
         self.declare_parameter("publish_port", 5555)
         self.declare_parameter("command_host", "127.0.0.1")
@@ -297,6 +337,10 @@ class LeRobotDataBridge(Node):
         self.declare_parameter("arm_action_source", "topic")
 
         self.declare_parameter("left_robot_joint_state_topic", "/left/franka/joint_states")
+        self.declare_parameter(
+            "left_franka_robot_state_topic",
+            "/left/franka_robot_state_broadcaster/robot_state",
+        )
         self.declare_parameter("left_arm_action_topic", "/left/franka/commanded_joint_states")
         self.declare_parameter(
             "left_robot_gripper_state_topic", "/left/franka_gripper/joint_states"
@@ -318,6 +362,10 @@ class LeRobotDataBridge(Node):
         )
 
         self.declare_parameter("right_robot_joint_state_topic", "/right/franka/joint_states")
+        self.declare_parameter(
+            "right_franka_robot_state_topic",
+            "/right/franka_robot_state_broadcaster/robot_state",
+        )
         self.declare_parameter("right_arm_action_topic", "/right/franka/commanded_joint_states")
         self.declare_parameter(
             "right_robot_gripper_state_topic", "/right/franka_gripper/joint_states"
@@ -386,7 +434,6 @@ class LeRobotDataBridge(Node):
                     lambda msg: self._store_joint_sample(self.latest_arm_action_samples, "right", msg),
                     10,
                 )
-
             if self.include_gripper:
                 self.create_subscription(
                     JointState,
@@ -400,6 +447,19 @@ class LeRobotDataBridge(Node):
                     lambda msg: self._store_gripper_action_sample("right", msg),
                     10,
                 )
+
+    def _create_torque_subscriptions(self) -> None:
+        topics = {
+            "left": self.left_franka_robot_state_topic,
+            "right": self.right_franka_robot_state_topic,
+        }
+        for arm_name in self._required_arms():
+            self.create_subscription(
+                FrankaRobotState,
+                topics[arm_name],
+                lambda msg, name=arm_name: self._store_torque_sample(name, msg),
+                10,
+            )
 
     def _initialize_deployment_clients(self) -> None:
         if pylibfranka is None:
@@ -690,6 +750,21 @@ class LeRobotDataBridge(Node):
             values=ordered_values,
             stamp_s=_stamp_to_float_seconds(msg.header.stamp.sec, msg.header.stamp.nanosec),
         )
+
+    def _store_torque_sample(self, arm_name: str, msg: Any) -> None:
+        stamp_s = _stamp_to_float_seconds(msg.header.stamp.sec, msg.header.stamp.nanosec)
+        try:
+            sample = make_torque_sample(
+                msg.measured_joint_state.name,
+                msg.measured_joint_state.effort,
+                msg.tau_ext_hat_filtered.name,
+                msg.tau_ext_hat_filtered.effort,
+                stamp_s,
+            )
+        except (TypeError, ValueError) as exc:
+            self.get_logger().warning(f"Ignoring invalid {arm_name} Franka torque state: {exc}")
+            return
+        self.latest_torque_samples[arm_name] = sample
 
     def _store_gripper_action_sample(self, arm_name: str, msg: Float32) -> None:
         now = self.get_clock().now().to_msg()
@@ -1132,6 +1207,40 @@ class LeRobotDataBridge(Node):
                     )
                 ):
                     stale_sources.append(f"{arm_name} gripper action")
+            if self.record_torque:
+                wait_reason = torque_sample_wait_reason(
+                    self.latest_torque_samples[arm_name],
+                    arm_name=arm_name,
+                    robot_joint_stamp_s=self.latest_robot_arm_samples[arm_name].stamp_s,
+                    reference_time_s=reference_time_s,
+                    max_age_sec=self.max_torque_age_sec,
+                    max_state_skew_sec=self.max_torque_sample_skew_sec,
+                )
+                if wait_reason is not None:
+                    stale_sources.append(wait_reason)
+                else:
+                    torque_sample = self.latest_torque_samples[arm_name]
+                    if torque_sample is None:
+                        continue
+                    synchronized_sources = {
+                        camera_name: sample.stamp_s
+                        for camera_name, sample in zip(
+                            self.camera_names, self.latest_camera_samples, strict=True
+                        )
+                        if sample is not None
+                    }
+                    if not self.deployment_mode:
+                        arm_action_sample = self._arm_action_sample(arm_name)
+                        if arm_action_sample is not None:
+                            synchronized_sources["action joint state"] = arm_action_sample.stamp_s
+                    skew_reason = torque_sample_skew_wait_reason(
+                        torque_sample,
+                        arm_name=arm_name,
+                        source_stamps_s=synchronized_sources,
+                        max_skew_sec=self.max_torque_sample_skew_sec,
+                    )
+                    if skew_reason is not None:
+                        stale_sources.append(skew_reason)
 
         for camera_name, sample in zip(self.camera_names, self.latest_camera_samples, strict=True):
             if sample is not None and reference_time_s - sample.stamp_s > self.max_data_age_sec:
@@ -1199,6 +1308,21 @@ class LeRobotDataBridge(Node):
             "include_right_arm": self.include_right_arm,
             "include_gripper": self.include_gripper,
         }
+        if self.record_torque:
+            torque_samples = [self.latest_torque_samples[name] for name in self._required_arms()]
+            if any(sample is None for sample in torque_samples):
+                return
+            packet["joint_torque"] = [
+                value for sample in torque_samples for value in sample.joint_torque
+            ]
+            packet["external_joint_torque"] = [
+                value for sample in torque_samples for value in sample.external_joint_torque
+            ]
+            packet["torque_dim"] = len(packet["joint_torque"])
+            packet["torque_unit"] = TORQUE_UNIT
+            packet["torque_stamp_s"] = {
+                name: self.latest_torque_samples[name].stamp_s for name in self._required_arms()
+            }
         self._socket.send_pyobj(packet)
 
         if self.deployment_mode:

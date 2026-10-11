@@ -2,6 +2,8 @@ lerobot_data_bridge:
   ros__parameters:
     sample_rate_hz: 15.0
     max_data_age_sec: 1.0
+    # Keep false: deployment launch intentionally omits franka_robot_state_broadcaster.
+    record_torque: false
     publish_host: "127.0.0.1"
     publish_port: 5555
     command_host: "127.0.0.1"
@@ -21,6 +23,7 @@ lerobot_data_bridge:
     require_gripper_freshness: true
     arm_action_source: "robot_state"
     left_robot_joint_state_topic: "/left/franka/joint_states"
+    left_franka_robot_state_topic: "/left/franka_robot_state_broadcaster/robot_state"
     left_robot_gripper_state_topic: "/left/franka_gripper/joint_states"
     left_deployment_gripper_command_topic: "/left/gripper/gripper_client/target_gripper_width_percent"
     left_deployment_joint_command_topic: "/left/deployment/joint_states"
