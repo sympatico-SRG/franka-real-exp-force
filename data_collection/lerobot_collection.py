@@ -22,6 +22,12 @@ if str(LOCAL_LEROBOT_SRC) not in sys.path:
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+from data_collection.torque_dataset import (
+    add_torque_to_frame,
+    torque_arrays_from_packet,
+    torque_config_from_packet,
+    torque_feature_specs,
+)
 from utils.dataset_stats import ensure_dataset_stats, normalize_episode_metadata
 from utils.fr3_kinematics import (
     EE_ACTION_DIM,
@@ -40,6 +46,7 @@ from utils.trajectory_metadata import (
 
 LEROBOT_INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
+TORQUE_CONFIG_PATH = Path("meta/real_exp_torque_config.json")
 SYSTEM_FEATURES = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
 DEFAULT_BRIDGE_READY_TIMEOUT_SEC = 2.0
 DEFAULT_VIDEO_CODEC = "h264"
@@ -258,6 +265,11 @@ def bridge_packet_readiness(packet: Any) -> tuple[bool, str]:
         )
 
     try:
+        torque_arrays_from_packet(packet)
+    except (TypeError, ValueError) as exc:
+        return False, f"bridge torque data is invalid ({exc})"
+
+    try:
         action_config_from_packet(packet)
         trajectory_config_from_packet(packet)
     except (KeyError, TypeError, ValueError) as exc:
@@ -362,6 +374,21 @@ def write_action_config(dataset_root: Path, action_config: dict[str, Any]) -> No
     action_config_path.write_text(json.dumps(action_config, indent=2, sort_keys=True) + "\n")
 
 
+def load_torque_config(dataset_root: Path) -> dict[str, Any] | None:
+    torque_config_path = dataset_root / TORQUE_CONFIG_PATH
+    if not torque_config_path.exists():
+        return None
+    return json.loads(torque_config_path.read_text())
+
+
+def write_torque_config(dataset_root: Path, torque_config: dict[str, Any] | None) -> None:
+    if torque_config is None:
+        return
+    torque_config_path = dataset_root / TORQUE_CONFIG_PATH
+    torque_config_path.parent.mkdir(parents=True, exist_ok=True)
+    torque_config_path.write_text(json.dumps(torque_config, indent=2, sort_keys=True) + "\n")
+
+
 def finalize_dataset(dataset: LeRobotDataset, repo_id: str) -> None:
     dataset.finalize()
     ensure_dataset_stats(repo_id, Path(dataset.root), force_recompute=True)
@@ -408,6 +435,7 @@ def build_features(first_packet: dict[str, Any]) -> tuple[dict[str, dict[str, An
     features["action.target_ee_pose"] = {
         "dtype": "float32", "shape": (ee_state_dim,), "names": ["target_ee_position_rotation_6d"]
     }
+    features.update(torque_feature_specs(first_packet))
 
     for camera_name in camera_names:
         camera = first_packet["cameras"][camera_name]
@@ -454,6 +482,7 @@ def make_dataset(
     features, camera_names = build_features(first_packet)
     action_config = action_config_from_packet(first_packet)
     trajectory_config = trajectory_config_from_packet(first_packet)
+    torque_config = torque_config_from_packet(first_packet)
     if is_lerobot_dataset_root(dataset_root):
         dataset = LeRobotDataset.resume(
             repo_id=repo_id,
@@ -465,6 +494,7 @@ def make_dataset(
         existing_trajectory_config = (
             json.loads(trajectory_config_path.read_text()) if trajectory_config_path.exists() else None
         )
+        existing_torque_config = load_torque_config(dataset_root)
         if existing_action_config is None or existing_trajectory_config is None:
             raise ValueError(
                 "Existing datasets must contain schema-v2 action and trajectory metadata; "
@@ -475,9 +505,11 @@ def make_dataset(
             normalize_feature_specs(dataset.features) == normalize_feature_specs(features)
             and resolved_existing_action_config == action_config
             and existing_trajectory_config == trajectory_config
+            and existing_torque_config == torque_config
         ):
             write_action_config(dataset_root, action_config)
             write_trajectory_config(dataset_root, trajectory_config)
+            write_torque_config(dataset_root, torque_config)
             return dataset, camera_names, True
 
         existing_features = sorted(normalize_feature_specs(dataset.features))
@@ -496,6 +528,8 @@ def make_dataset(
         print(f"  incoming action config: {action_config}")
         print(f"  existing trajectory config: {existing_trajectory_config}")
         print(f"  incoming trajectory config: {trajectory_config}")
+        print(f"  existing torque config: {existing_torque_config}")
+        print(f"  incoming torque config: {torque_config}")
         dataset_root = compatible_root
 
     dataset = LeRobotDataset.create(
@@ -508,6 +542,7 @@ def make_dataset(
     )
     write_action_config(dataset_root, action_config)
     write_trajectory_config(dataset_root, trajectory_config)
+    write_torque_config(dataset_root, torque_config)
     return dataset, camera_names, False
 
 
@@ -531,6 +566,7 @@ def packet_to_frame(packet: dict[str, Any], camera_names: list[str], task_name: 
     frame["action.delta_joint"] = arm_joint_delta(
         frame["observation.joint_state"], frame["action.target_joint"], trajectory_config
     )
+    add_torque_to_frame(frame, packet)
     for camera_name in camera_names:
         rgb = np.asarray(packet["cameras"][camera_name]["rgb"], dtype=np.uint8)
         frame[f"observation.images.{camera_name}"] = np.transpose(rgb, (2, 0, 1))
@@ -627,6 +663,7 @@ def packet_pair_to_frame(
     frame["action.delta_joint"] = arm_joint_delta(
         frame["observation.joint_state"], frame["action.target_joint"], trajectory_config
     )
+    add_torque_to_frame(frame, current_packet)
     for camera_name in camera_names:
         rgb = np.asarray(current_packet["cameras"][camera_name]["rgb"], dtype=np.uint8)
         frame[f"observation.images.{camera_name}"] = np.transpose(rgb, (2, 0, 1))

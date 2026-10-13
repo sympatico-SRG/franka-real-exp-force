@@ -35,7 +35,7 @@ This repo uses two different Python environments:
 
 ### Data Collection
 
-Data collection and replay instructions live in [data_collection/DATA_COLLECTION_README.md](data_collection/DATA_COLLECTION_README.md).
+Data collection and replay instructions live in [data_collection/DATA_COLLECTION_README.md](data_collection/DATA_COLLECTION_README.md). The two-host Chinese startup and optional FR3 joint-torque recording guide is [data_collection/DATA_COLLECTION_STARTUP.zh-CN.md](data_collection/DATA_COLLECTION_STARTUP.zh-CN.md).
 - [`scripts/start_teleoperation.sh`](scripts/start_teleoperation.sh): start left-, right-, or dual-arm GELLO/FR3 teleoperation with matching Franka grippers or Wuji hands.
 - [`scripts/start_meta_quest_pose_monitor.sh`](scripts/start_meta_quest_pose_monitor.sh): receive and display uncalibrated Quest wrist/controller poses without connecting to a robot. See [`data_collection/meta_quest/README.md`](data_collection/meta_quest/README.md).
 - `start_teleoperation.sh` accepts exactly one end-effector mode (`--arm`, `--gripper`, or `--hand`) and one arm selection (`--left`, `--right`, or `--duo`).

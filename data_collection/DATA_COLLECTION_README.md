@@ -1,5 +1,8 @@
 # Data Collection
 
+中文双机启动、时间同步检查及可选 FR3 关节力矩记录流程见
+[DATA_COLLECTION_STARTUP.zh-CN.md](DATA_COLLECTION_STARTUP.zh-CN.md)。
+
 ## Overview
 
 - `lerobot_collection.py`: Minimal script for recording synchronized RealSense images and robot state/action data into a LeRobot dataset.
