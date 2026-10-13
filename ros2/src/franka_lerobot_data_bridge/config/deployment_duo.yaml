@@ -1,6 +1,8 @@
 lerobot_data_bridge:
   ros__parameters:
     sample_rate_hz: 15.0
+    # Torque recording is collection-only and intentionally disabled for deployment.
+    record_torque: false
     max_data_age_sec: 0.25
     camera_max_age_sec: 0.25
     robot_state_max_age_sec: 0.25

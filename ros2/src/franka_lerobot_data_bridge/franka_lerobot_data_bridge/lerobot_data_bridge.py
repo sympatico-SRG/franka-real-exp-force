@@ -18,6 +18,14 @@ from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import Float32
 from std_srvs.srv import SetBool
 
+from franka_lerobot_data_bridge.torque import (
+    TORQUE_UNIT,
+    TorqueSample,
+    make_torque_sample,
+    torque_sample_skew_wait_reason,
+    torque_sample_wait_reason,
+)
+
 
 def _add_repository_root_to_path() -> None:
     for parent in Path(__file__).resolve().parents:
@@ -177,6 +185,11 @@ class LeRobotDataBridge(Node):
         self.gripper_state_max_age_sec = float(self.get_parameter("gripper_state_max_age_sec").value)
         self.hand_data_max_age_sec = float(self.get_parameter("hand_data_max_age_sec").value)
         self.max_camera_skew_sec = float(self.get_parameter("max_camera_skew_sec").value)
+        self.record_torque = bool(self.get_parameter("record_torque").value)
+        self.max_torque_age_sec = float(self.get_parameter("max_torque_age_sec").value)
+        self.max_torque_sample_skew_sec = float(
+            self.get_parameter("max_torque_sample_skew_sec").value
+        )
         self.publish_host = str(self.get_parameter("publish_host").value)
         self.publish_port = int(self.get_parameter("publish_port").value)
         self.command_host = str(self.get_parameter("command_host").value)
@@ -186,6 +199,10 @@ class LeRobotDataBridge(Node):
         self.camera_cache_port = int(self.get_parameter("camera_cache_port").value)
         self.task_name = str(self.get_parameter("task_name").value)
         self.deployment_mode = bool(self.get_parameter("deployment_mode").value)
+        if self.record_torque and self.deployment_mode:
+            raise ValueError("record_torque is collection-only and cannot be used in deployment mode")
+        if self.max_torque_age_sec <= 0.0 or self.max_torque_sample_skew_sec <= 0.0:
+            raise ValueError("torque age and synchronization limits must be positive")
         self.deployment_start_active = bool(self.get_parameter("deployment_start_active").value)
         self.deployment_hold_warmup_sec = float(
             self.get_parameter("deployment_hold_warmup_sec").value
@@ -296,6 +313,10 @@ class LeRobotDataBridge(Node):
         self.latest_gripper_action_samples: dict[str, JointSample | None] = {"left": None, "right": None}
         self.latest_hand_samples: dict[str, HandSample | None] = {"left": None, "right": None}
         self.latest_robot_ee_samples: dict[str, PoseSample | None] = {"left": None, "right": None}
+        self.latest_torque_samples: dict[str, TorqueSample | None] = {
+            "left": None,
+            "right": None,
+        }
         self.latest_target_ee_samples: dict[str, PoseSample | None] = {"left": None, "right": None}
         self.latest_flange_to_ee: dict[str, np.ndarray | None] = {"left": None, "right": None}
         self._target_fk: Any | None = None
@@ -336,6 +357,7 @@ class LeRobotDataBridge(Node):
         self._command_socket: zmq.Socket | None = None
         self._last_wait_reason: str | None = None
         self._last_wait_reason_log_time_s = 0.0
+        self._last_invalid_torque_warning_time_s = 0.0
         self._latest_deployment_command: dict[str, Any] | None = None
         self._latest_deployment_command_stamp_s = 0.0
         self._deployment_command_active = False
@@ -400,6 +422,11 @@ class LeRobotDataBridge(Node):
             )
         else:
             self.get_logger().info(f"Arm action source mode: {self.arm_action_source}")
+            self.get_logger().info(
+                "Franka joint-torque recording is "
+                + ("enabled" if self.record_torque else "disabled")
+                + "."
+            )
 
     def _declare_parameters(self) -> None:
         self.declare_parameter("sample_rate_hz", 15.0)
@@ -409,6 +436,9 @@ class LeRobotDataBridge(Node):
         self.declare_parameter("gripper_state_max_age_sec", 0.25)
         self.declare_parameter("hand_data_max_age_sec", 0.5)
         self.declare_parameter("max_camera_skew_sec", 0.067)
+        self.declare_parameter("record_torque", False)
+        self.declare_parameter("max_torque_age_sec", 0.1)
+        self.declare_parameter("max_torque_sample_skew_sec", 0.05)
         self.declare_parameter("publish_host", "127.0.0.1")
         self.declare_parameter("publish_port", 5555)
         self.declare_parameter("command_host", "127.0.0.1")
@@ -863,6 +893,34 @@ class LeRobotDataBridge(Node):
             self.latest_flange_to_ee[arm_name] = _pose_message_to_matrix(msg.f_t_ee.pose)
         except (AttributeError, TypeError, ValueError):
             pass
+        if not self.record_torque:
+            return
+
+        try:
+            robot_state_stamp = _stamp_to_float_seconds(
+                msg.header.stamp.sec, msg.header.stamp.nanosec
+            )
+            if robot_state_stamp <= 0.0:
+                robot_state_stamp = _stamp_to_float_seconds(
+                    msg.measured_joint_state.header.stamp.sec,
+                    msg.measured_joint_state.header.stamp.nanosec,
+                )
+            if robot_state_stamp <= 0.0:
+                robot_state_stamp = stamp
+            self.latest_torque_samples[arm_name] = make_torque_sample(
+                msg.measured_joint_state.name,
+                msg.measured_joint_state.effort,
+                msg.tau_ext_hat_filtered.name,
+                msg.tau_ext_hat_filtered.effort,
+                robot_state_stamp,
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            now_s = self._now_s()
+            if now_s - self._last_invalid_torque_warning_time_s > 5.0:
+                self.get_logger().warning(
+                    f"Ignoring invalid {arm_name} Franka torque sample: {exc}"
+                )
+                self._last_invalid_torque_warning_time_s = now_s
 
     def _drain_hand_telemetry(self) -> None:
         if self._hand_telemetry_socket is None:
@@ -1321,6 +1379,8 @@ class LeRobotDataBridge(Node):
                 return False, f"waiting for {arm_name} robot joint states"
             if self.latest_robot_ee_samples[arm_name] is None:
                 return False, f"waiting for {arm_name} end-effector pose state"
+            if self.record_torque and self.latest_torque_samples[arm_name] is None:
+                return False, f"waiting for {arm_name} Franka torque state"
             if self.latest_flange_to_ee[arm_name] is None:
                 return False, f"waiting for {arm_name} flange-to-end-effector transform"
             if not self.deployment_mode and self._arm_action_sample(arm_name) is None:
@@ -1389,6 +1449,43 @@ class LeRobotDataBridge(Node):
                 "camera bundle skew "
                 f"({max(camera_stamps) - min(camera_stamps):.3f}s > {self.max_camera_skew_sec:.3f}s)"
             )
+
+        if self.record_torque:
+            camera_source_stamps = {
+                camera_name: sample.stamp_s
+                for camera_name, sample in zip(
+                    self.camera_names, self.latest_camera_samples, strict=True
+                )
+                if sample is not None
+            }
+            for arm_name in self._required_arms():
+                torque_sample = self.latest_torque_samples[arm_name]
+                joint_sample = self.latest_robot_arm_samples[arm_name]
+                ee_sample = self.latest_robot_ee_samples[arm_name]
+                if torque_sample is None or joint_sample is None or ee_sample is None:
+                    continue
+                reason = torque_sample_wait_reason(
+                    torque_sample,
+                    arm_name=arm_name,
+                    robot_joint_stamp_s=joint_sample.stamp_s,
+                    reference_time_s=reference_time_s,
+                    max_age_sec=self.max_torque_age_sec,
+                    max_state_skew_sec=self.max_torque_sample_skew_sec,
+                )
+                if reason is None:
+                    source_stamps = dict(camera_source_stamps)
+                    source_stamps["end-effector pose"] = ee_sample.stamp_s
+                    action_sample = self._arm_action_sample(arm_name)
+                    if action_sample is not None:
+                        source_stamps["action joint state"] = action_sample.stamp_s
+                    reason = torque_sample_skew_wait_reason(
+                        torque_sample,
+                        arm_name=arm_name,
+                        source_stamps_s=source_stamps,
+                        max_skew_sec=self.max_torque_sample_skew_sec,
+                    )
+                if reason is not None:
+                    stale_sources.append(reason)
 
         if stale_sources:
             return False, f"waiting for fresh data from {', '.join(stale_sources)}"
@@ -1625,6 +1722,38 @@ class LeRobotDataBridge(Node):
             "robot_state_stamp_s": oldest_robot_state_stamp_s,
             "robot_state_freshness": state_freshness,
         }
+        if self.record_torque:
+            torque_samples = [
+                self.latest_torque_samples[arm_name]
+                for arm_name in self._required_arms()
+            ]
+            if any(sample is None for sample in torque_samples):
+                return
+            joint_torque: list[float] = []
+            external_joint_torque: list[float] = []
+            torque_freshness: dict[str, dict[str, float]] = {}
+            for arm_name, sample in zip(
+                self._required_arms(), torque_samples, strict=True
+            ):
+                if sample is None:
+                    return
+                joint_torque.extend(sample.joint_torque)
+                external_joint_torque.extend(sample.external_joint_torque)
+                torque_freshness[arm_name] = {
+                    "stamp_s": sample.stamp_s,
+                    "age_s": max(0.0, bridge_publish_s - sample.stamp_s),
+                }
+            packet_base.update(
+                {
+                    "record_torque": True,
+                    "joint_torque": joint_torque,
+                    "external_joint_torque": external_joint_torque,
+                    "torque_dim": len(joint_torque),
+                    "torque_unit": TORQUE_UNIT,
+                    "torque_arm_order": self._required_arms(),
+                    "torque_freshness": torque_freshness,
+                }
+            )
         self._camera_cache_socket.send_pyobj(packet_base | {"cameras": camera_payload})
 
         if self.deployment_mode:

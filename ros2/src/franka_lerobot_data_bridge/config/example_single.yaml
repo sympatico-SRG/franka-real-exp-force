@@ -2,6 +2,10 @@ lerobot_data_bridge:
   ros__parameters:
     sample_rate_hz: 15.0
     max_data_age_sec: 0.5
+    # Opt-in only. Reuses the existing FrankaRobotState topic; no extra FCI connection.
+    record_torque: false
+    max_torque_age_sec: 0.1
+    max_torque_sample_skew_sec: 0.05
     publish_host: "127.0.0.1"
     publish_port: 5555
     task_name: "franka_gello_single_arm_teleop"
