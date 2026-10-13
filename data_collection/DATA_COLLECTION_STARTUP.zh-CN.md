@@ -7,6 +7,8 @@
 
 本次新增功能只从现有 `franka_msgs/msg/FrankaRobotState` 消息读取状态，不新建 FCI/libfranka 连接，不修改控制律、控制频率、动作命令或安全参数。力矩记录默认关闭。
 
+已对照 2026-10-13 上传的实际 client 快照：client 为 Ubuntu 22.04、ROS 2 Humble、Python 3.10，使用 `rmw_cyclonedds_cpp` 和 `ROS_DOMAIN_ID=0`；server 为 ROS 2 Jazzy。client 主仓库基线 `a85aa1c`、GELLO `abe9fcd`、LeRobot `4eecbad` 与本分支的修改基线一致。
+
 > 当前仅完成无机器人软件测试。第一次连接真实 FR3 时必须由熟悉系统的人员在场，并按实验室安全流程执行。
 
 ## 1. 数据内容
@@ -42,7 +44,36 @@ ss -ltnp | grep -E ':5555|:8080|:8081'
 ps -ef | grep -E 'realsense|start_data_collection' | grep -v grep
 ```
 
-## 3. 首次构建 server bridge
+## 3. 首次构建
+
+### 3.1 在 client 构建个人副本
+
+不要覆盖 `/home/landau/real-exp`。在个人副本中执行：
+
+```bash
+cd /home/landau/srg/franka-real-exp-force/gello_software/ros2
+source /opt/ros/humble/setup.bash
+source ~/franka_ros2_ws/install/local_setup.bash
+colcon build --packages-select \
+  franka_fr3_arm_controllers \
+  franka_gello_state_publisher \
+  franka_gripper_manager \
+  --symlink-install
+source install/local_setup.bash
+```
+
+该步骤只编译个人目录中的代码，不启动 ROS 控制节点，也不会连接机器人。
+
+运行无运动静态预检：
+
+```bash
+cd /home/landau/srg/franka-real-exp-force
+./scripts/check_data_collection_client.sh
+```
+
+预期显示 `Static Franka torque interface check: PASS`。该脚本用 Python 检查消息定义，因为实际 client 没有安装 `ros2 interface` 命令扩展。
+
+### 3.2 在 server 构建 bridge
 
 在 server 执行：
 
@@ -87,11 +118,20 @@ record_torque: false
 下面以双臂二指夹爪为例；单臂用 `--left` 或 `--right`，只采机械臂可使用 `--arm`。路径以 client 实际部署路径为准：
 
 ```bash
-cd ~/real-exp
+cd /home/landau/srg/franka-real-exp-force
 ./scripts/start_data_collection_client.sh --duo --gripper
 ```
 
 此命令会连接真实机器人。操作者必须留在机器人旁，确保急停可立即触达。不要为了读力矩另开 libfranka/FCI 会话。
+
+client 启动成功后，可在另一个 client 终端做只读 Topic 预检：
+
+```bash
+cd /home/landau/srg/franka-real-exp-force
+./scripts/check_data_collection_client.sh --duo
+```
+
+此命令只检查左右 `FrankaRobotState` Topic 类型，不发布命令。单臂分别使用 `--left` 或 `--right`。
 
 ### 5.2 在 server 检查 RobotState
 
@@ -101,8 +141,8 @@ source /opt/ros/jazzy/setup.bash
 source ~/franka_ros2_ws/install/local_setup.bash
 source /home/pair1/srg/real-exp-force/gello_software/ros2/install/local_setup.bash
 
-ros2 topic info /left/franka_robot_state_broadcaster/robot_state -v
-ros2 topic echo /left/franka_robot_state_broadcaster/robot_state --once
+ros2 topic info /left/franka_robot_state_broadcaster/robot_state -v --no-daemon
+ros2 topic echo /left/franka_robot_state_broadcaster/robot_state --once --no-daemon
 ```
 
 右臂对应 `/right/franka_robot_state_broadcaster/robot_state`。输出中应能看到：
