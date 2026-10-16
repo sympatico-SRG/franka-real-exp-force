@@ -4,6 +4,20 @@ import socket
 import subprocess
 
 
+CAMERA_PROCESS_MARKERS = (
+    '/lib/franka_realsense_camera_publisher/realsense_camera_publisher',
+    'ros2 launch franka_realsense_camera_publisher cameras.launch.py',
+)
+
+
+def find_camera_owners(process_table: str) -> list[str]:
+    return [
+        line.strip()
+        for line in process_table.splitlines()
+        if any(marker in line for marker in CAMERA_PROCESS_MARKERS)
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--host', required=True)
@@ -36,10 +50,9 @@ def main():
     # Starting another publisher risks opening devices already used by another workspace.
     # Report the owner; never stop it or silently switch camera configuration.
     processes = subprocess.check_output(['ps', '-eo', 'pid=,args='], text=True)
-    owners = [line.strip() for line in processes.splitlines()
-              if '/lib/franka_realsense_camera_publisher/realsense_camera_publisher' in line]
+    owners = find_camera_owners(processes)
     if owners:
-        print('Error: existing RealSense publisher processes detected; do not start duplicate camera owners:', flush=True)
+        print('Error: existing RealSense launch/publisher processes detected; do not start duplicate camera owners:', flush=True)
         for owner in owners:
             print(f'  {owner}', flush=True)
         print('Arrange camera ownership with the existing task before starting this full camera stack.', flush=True)

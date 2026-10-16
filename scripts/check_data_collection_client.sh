@@ -9,8 +9,8 @@ usage() {
 Usage: ./scripts/check_data_collection_client.sh [--left|--right|--duo]
 
 With no arm option, validate only the installed ROS/Franka message interface.
-With an arm option, additionally require the selected RobotState topic(s) to be
-visible. Start the normal client control stack first when using this live check.
+With an arm option, additionally require one real RobotState payload from each
+selected arm. Start the normal client control stack first when using this check.
 EOF
 }
 
@@ -95,5 +95,10 @@ for arm_name in "${arm_names[@]}"; do
   topic_type="$(timeout 10s ros2 topic type "${topic}" --no-daemon 2>/dev/null || true)"
   [[ "${topic_type}" == "franka_msgs/msg/FrankaRobotState" ]] || die \
     "${topic} is unavailable or has unexpected type ${topic_type:-<none>}"
-  echo "Live RobotState topic check: PASS (${topic})"
+  if ! timeout 10s ros2 topic echo \
+    "${topic}" franka_msgs/msg/FrankaRobotState --once --no-daemon \
+    --qos-reliability best_effort >/dev/null 2>&1; then
+    die "${topic} was discovered but no RobotState payload was received"
+  fi
+  echo "Live RobotState payload check: PASS (${topic})"
 done

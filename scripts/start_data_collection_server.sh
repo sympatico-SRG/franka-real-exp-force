@@ -29,6 +29,8 @@ Required:
 
 Options:
   --check-only          Check packages, ports and camera processes; start nothing.
+  --record-torque       Record synchronized measured and external joint torques.
+                        Default is off and the legacy dataset schema is unchanged.
   --camera-cache-port PORT
                         Bridge camera-cache port (default: 5557).
   --record              Start the LeRobot recorder on this server.
@@ -52,6 +54,7 @@ die() { echo "Error: $*" >&2; exit 1; }
 arm_mode=""
 gripper_mode=""
 record=0
+record_torque=0
 check_only=0
 camera_cache_port=5557
 local_dir="./lerobot_data"
@@ -77,6 +80,7 @@ while [[ "$#" -gt 0 ]]; do
       shift
       ;;
     --check-only) check_only=1; shift ;;
+    --record-torque) record_torque=1; shift ;;
     --camera-cache-port)
       [[ "$#" -ge 2 ]] || die "--camera-cache-port requires a port"
       camera_cache_port="$2"; shift 2 ;;
@@ -236,6 +240,15 @@ for topic in "${required_bridge_topics[@]}"; do
   echo "Ready: ${topic} is publishing on the data server"
 done
 
+if [[ "${record_torque}" -eq 1 ]]; then
+  # Validate real payloads before cameras or the bridge are started. Topic
+  # discovery alone is insufficient across the Humble/Jazzy host boundary.
+  DATA_SERVER_ROS_DISTRO="${ros_distro}" \
+    bash "${script_dir}/check_data_collection_server.sh" \
+    "--${arm_mode}" --timeout 10 || die \
+    "Franka torque preflight failed; no cameras, bridge or recorder were started"
+fi
+
 
 declare -a child_pids=()
 declare -A child_names=()
@@ -303,7 +316,7 @@ trap shutdown EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-echo "Data-server mode: ${arm_mode}; ROS: ${ros_distro}; RMW: ${RMW_IMPLEMENTATION}; bridge: tcp://${bridge_host}:${bridge_port}"
+echo "Data-server mode: ${arm_mode}; torque: $([[ "${record_torque}" -eq 1 ]] && echo on || echo off); ROS: ${ros_distro}; RMW: ${RMW_IMPLEMENTATION}; bridge: tcp://${bridge_host}:${bridge_port}"
 
 start_process "RealSense camera publisher" \
   ros2 launch franka_realsense_camera_publisher cameras.launch.py
@@ -314,6 +327,7 @@ start_process "LeRobot data bridge" \
   "camera_cache_host:=127.0.0.1" "camera_cache_port:=${camera_cache_port}" \
   "include_gripper:=$([[ "${gripper_mode}" == "gripper" ]] && echo true || echo false)" \
   "include_hand:=$([[ "${gripper_mode}" == "hand" ]] && echo true || echo false)" \
+  "record_torque:=$([[ "${record_torque}" -eq 1 ]] && echo true || echo false)" \
   "arm_mode:=${arm_mode}" \
   "hand_telemetry_host:=${bridge_host}" "hand_telemetry_port:=${hand_telemetry_port}"
 

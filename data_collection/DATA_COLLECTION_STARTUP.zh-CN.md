@@ -89,24 +89,18 @@ source install/local_setup.bash
 
 ## 4. 开启或关闭力矩记录
 
-根据采集模式修改一个配置文件：
+推荐通过 server 启动参数开启，不需要修改 YAML：
 
-- 双臂：`gello_software/ros2/src/franka_lerobot_data_bridge/config/example_duo.yaml`
-- 左臂：`gello_software/ros2/src/franka_lerobot_data_bridge/config/example_single.yaml`
-- 右臂：`gello_software/ros2/src/franka_lerobot_data_bridge/config/example_right.yaml`
-
-开启：
-
-```yaml
-record_torque: true
-max_torque_age_sec: 0.1
-max_torque_sample_skew_sec: 0.05
+```bash
+./scripts/start_data_collection_server.sh --duo --gripper --record-torque
 ```
 
-关闭并恢复旧行为：
+不传 `--record-torque` 即为关闭，启动脚本会显式覆盖为 `false`，旧数据集 schema 保持不变。YAML 中继续保留安全默认值和同步阈值：
 
 ```yaml
 record_torque: false
+max_torque_age_sec: 0.1
+max_torque_sample_skew_sec: 0.05
 ```
 
 `max_torque_age_sec` 限制状态的新鲜度；`max_torque_sample_skew_sec` 限制力矩与关节状态、动作、末端位姿和所选相机帧的时间差。缺失、过期、来自未来或超出时间差的样本会等待下一帧，而不是沿用旧力矩。
@@ -131,7 +125,7 @@ cd /home/landau/srg/franka-real-exp-force
 ./scripts/check_data_collection_client.sh --duo
 ```
 
-此命令只检查左右 `FrankaRobotState` Topic 类型，不发布命令。单臂分别使用 `--left` 或 `--right`。
+此命令只订阅并验证左右各一条真实 `FrankaRobotState`，不发布命令。单臂分别使用 `--left` 或 `--right`。
 
 ### 5.2 在 server 检查 RobotState（只读，不启动机械臂）
 
@@ -168,7 +162,7 @@ Humble client / Jazzy server 的 DDS 发现可能出现 `Failed to parse type ha
 ```bash
 cd /home/pair1/srg/real-exp-force
 ./scripts/start_data_collection_server.sh \
-  --duo --gripper --record \
+  --duo --gripper --record-torque --record \
   --local-dir /home/pair1/srg/datasets/fr3_torque_test \
   --repo-id local/fr3_torque_test \
   --bridge-host 192.168.50.13 \
@@ -240,7 +234,7 @@ PY
 
 ## 9. 兼容、回滚与待验证项
 
-- 最快回滚：把相应 YAML 的 `record_torque` 改回 `false`。
+- 最快回滚：启动时移除 `--record-torque`；YAML 默认值保持为 `false`。
 - Git 回滚：对本次提交执行 `git revert <commit>`，不要在多人共享仓库使用 `reset --hard`。
 - 旧数据集没有 torque feature 和 torque metadata，仍按旧 schema 读取。
 - 旧模型不应请求新增字段，关闭开关时推理和训练输入保持不变。
