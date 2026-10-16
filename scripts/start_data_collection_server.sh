@@ -28,6 +28,9 @@ Required:
   --hand                Include 20-joint Wuji hand current and target angles.
 
 Options:
+  --check-only          Check packages, ports and camera processes; start nothing.
+  --camera-cache-port PORT
+                        Bridge camera-cache port (default: 5557).
   --record              Start the LeRobot recorder on this server.
   --local-dir PATH      Dataset directory for --record (default: ./lerobot_data).
   --repo-id ID          LeRobot repo id for --record.
@@ -49,6 +52,8 @@ die() { echo "Error: $*" >&2; exit 1; }
 arm_mode=""
 gripper_mode=""
 record=0
+check_only=0
+camera_cache_port=5557
 local_dir="./lerobot_data"
 repo_id="local/franka_gello_teleop"
 bridge_host="${DATA_COLLECTION_SERVER_IP:-192.168.50.13}"
@@ -71,6 +76,10 @@ while [[ "$#" -gt 0 ]]; do
       [[ "${gripper_mode}" != "no-gripper" ]] || gripper_mode="arm"
       shift
       ;;
+    --check-only) check_only=1; shift ;;
+    --camera-cache-port)
+      [[ "$#" -ge 2 ]] || die "--camera-cache-port requires a port"
+      camera_cache_port="$2"; shift 2 ;;
     --record) record=1; shift ;;
     --local-dir)
       [[ "$#" -ge 2 ]] || die "--local-dir requires a path"
@@ -139,8 +148,19 @@ for setup_file in "${setup_files[@]}"; do
 done
 set -u
 
+# The audited Humble robot client uses Cyclone DDS. Preserve explicit overrides.
+export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
 export ROS_DOMAIN_ID="${ros_domain_id}"
-export ROS_LOCALHOST_ONLY=0
+if [[ "${ros_distro}" == humble ]]; then
+  export ROS_LOCALHOST_ONLY=0
+else
+  unset ROS_LOCALHOST_ONLY
+fi
+if [[ -z "${CYCLONEDDS_URI:-}" && -r "${HOME}/.config/cyclonedds.xml" ]]; then
+  export CYCLONEDDS_URI="file://${HOME}/.config/cyclonedds.xml"
+fi
+export ROS_LOG_DIR="${repository_root}/../ros_diagnostics/log"
+export PYTHONDONTWRITEBYTECODE=1
 export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
 
 command -v setsid >/dev/null 2>&1 || die "required command not found: setsid"
@@ -148,8 +168,24 @@ command -v timeout >/dev/null 2>&1 || die "required command not found: timeout"
 command -v pkill >/dev/null 2>&1 || die "required command not found: pkill"
 command -v ps >/dev/null 2>&1 || die "required command not found: ps"
 command -v ros2 >/dev/null 2>&1 || die "ros2 is unavailable after sourcing ROS ${ros_distro}"
-ros2 pkg prefix franka_msgs >/dev/null 2>&1 || die \
-  "required ROS package is unavailable after sourcing overlays: franka_msgs (source/build the Franka ROS 2 workspace)"
+# Check every required package before starting any child process.
+preflight_status=0
+for package in franka_msgs franka_lerobot_data_bridge franka_realsense_camera_publisher; do
+  if ! ros2 pkg prefix "${package}" >/dev/null 2>&1; then
+    echo "Error: missing ROS package ${package}; build it in ${repository_root}/gello_software/ros2" >&2
+    preflight_status=1
+  fi
+done
+if ! /usr/bin/python3 "${script_dir}/check_data_server_resources.py" \
+  --host "${bridge_host}" --port "${bridge_port}" --cache-port "${camera_cache_port}" \
+  --hand-port "$([[ "${gripper_mode}" == hand ]] && echo "${hand_telemetry_port}" || echo 0)"; then
+  preflight_status=1
+fi
+[[ "${preflight_status}" -eq 0 ]] || die "startup preflight failed; no cameras, bridge or recorder were started"
+if [[ "${check_only}" -eq 1 ]]; then
+  echo "PASS: packages and resources available; live topic reception was not checked. Nothing started."
+  exit 0
+fi
 
 ros_python="/usr/bin/python3"
 [[ -x "${ros_python}" ]] || die "ROS Python interpreter is missing: ${ros_python}"
@@ -184,6 +220,23 @@ case "${arm_mode}" in
   right|duo) config_file="example_${arm_mode}.yaml" ;;
   *) die "unsupported arm mode: ${arm_mode}" ;;
 esac
+required_bridge_topics=()
+if [[ "${arm_mode}" == "duo" || "${arm_mode}" == "left" ]]; then
+  required_bridge_topics+=("/left/joint_states" "/left/gello/raw_joint_states" "/left/gello/accepted_joint_states")
+fi
+if [[ "${arm_mode}" == "duo" || "${arm_mode}" == "right" ]]; then
+  required_bridge_topics+=("/right/joint_states" "/right/gello/raw_joint_states" "/right/gello/accepted_joint_states")
+fi
+for topic in "${required_bridge_topics[@]}"; do
+  if ! timeout 10s ros2 topic echo \
+    "${topic}" sensor_msgs/msg/JointState --once --no-daemon --qos-reliability best_effort \
+    >/dev/null 2>&1; then
+    die "no JointState payload received from ${topic}; check cross-host ROS 2 discovery and the control stack"
+  fi
+  echo "Ready: ${topic} is publishing on the data server"
+done
+
+
 declare -a child_pids=()
 declare -A child_names=()
 shutdown_started=0
@@ -250,7 +303,7 @@ trap shutdown EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-echo "Data-server mode: ${arm_mode}; ROS: ${ros_distro}; bridge: tcp://${bridge_host}:${bridge_port}"
+echo "Data-server mode: ${arm_mode}; ROS: ${ros_distro}; RMW: ${RMW_IMPLEMENTATION}; bridge: tcp://${bridge_host}:${bridge_port}"
 
 start_process "RealSense camera publisher" \
   ros2 launch franka_realsense_camera_publisher cameras.launch.py
@@ -258,26 +311,12 @@ start_process "LeRobot data bridge" \
   ros2 launch franka_lerobot_data_bridge bridge.launch.py \
   "config_file:=${config_file}" \
   "publish_host:=${bridge_host}" "publish_port:=${bridge_port}" \
+  "camera_cache_host:=127.0.0.1" "camera_cache_port:=${camera_cache_port}" \
   "include_gripper:=$([[ "${gripper_mode}" == "gripper" ]] && echo true || echo false)" \
   "include_hand:=$([[ "${gripper_mode}" == "hand" ]] && echo true || echo false)" \
   "arm_mode:=${arm_mode}" \
   "hand_telemetry_host:=${bridge_host}" "hand_telemetry_port:=${hand_telemetry_port}"
 
-required_bridge_topics=()
-if [[ "${arm_mode}" == "duo" || "${arm_mode}" == "left" ]]; then
-  required_bridge_topics+=("/left/joint_states" "/left/gello/raw_joint_states" "/left/gello/accepted_joint_states")
-fi
-if [[ "${arm_mode}" == "duo" || "${arm_mode}" == "right" ]]; then
-  required_bridge_topics+=("/right/joint_states" "/right/gello/raw_joint_states" "/right/gello/accepted_joint_states")
-fi
-for topic in "${required_bridge_topics[@]}"; do
-  if ! timeout 10s ros2 topic echo \
-    "${topic}" sensor_msgs/msg/JointState --once --no-daemon \
-    >/dev/null 2>&1; then
-    die "no JointState payload received from ${topic}; check cross-host ROS 2 discovery and the control stack"
-  fi
-  echo "Ready: ${topic} is publishing on the data server"
-done
 
 if [[ "${record}" -eq 1 ]]; then
   lerobot_conda_env="${LEROBOT_CONDA_ENV:-lerobot}"

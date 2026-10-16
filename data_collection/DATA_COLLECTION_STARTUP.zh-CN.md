@@ -133,25 +133,35 @@ cd /home/landau/srg/franka-real-exp-force
 
 此命令只检查左右 `FrankaRobotState` Topic 类型，不发布命令。单臂分别使用 `--left` 或 `--right`。
 
-### 5.2 在 server 检查 RobotState
+### 5.2 在 server 检查 RobotState（只读，不启动机械臂）
 
 ```bash
-export ROS_DOMAIN_ID=0
-source /opt/ros/jazzy/setup.bash
-source ~/franka_ros2_ws/install/local_setup.bash
-source /home/pair1/srg/real-exp-force/gello_software/ros2/install/local_setup.bash
-
-ros2 topic info /left/franka_robot_state_broadcaster/robot_state -v --no-daemon
-ros2 topic echo /left/franka_robot_state_broadcaster/robot_state --once --no-daemon
+cd /home/pair1/srg/real-exp-force
+# 离线检查：系统 Python、ROS、Franka 消息类型支持与序列化
+bash scripts/check_data_collection_server.sh
+# 仅订阅已经存在的左右状态发布者，最多等待 10 秒
+bash scripts/check_data_collection_server.sh --duo --timeout 10
+# 需要查看原始 Cyclone DDS 警告时添加 --verbose
 ```
 
-右臂对应 `/right/franka_robot_state_broadcaster/robot_state`。输出中应能看到：
+服务器默认 Jazzy；可通过 `DATA_SERVER_ROS_DISTRO` 指定已安装的其他发行版。
+检查脚本和数采启动脚本默认使用与已审计 Humble client 一致的
+`rmw_cyclonedds_cpp`，保留显式 `RMW_IMPLEMENTATION` 覆盖。
+检查使用系统 Python，不依赖 Conda，不修改调用者环境或 `.bashrc`。
 
-- `measured_joint_state.effort`，恰好 7 个有限数值；
-- `tau_ext_hat_filtered.effort`，恰好 7 个有限数值；
-- 有效 ROS 时间戳。
+单臂使用 `--left` 或 `--right`。只有真正收到消息，且两组 effort 都包含
+7 个有限值、header 时间戳非零且有效，才报告 live PASS；这不替代录制时的新鲜度和同步检查。
+只有订阅者而没有发布者时会明确失败（退出码 2），不会启动或恢复机器人。
 
-若 server 看不到 Topic，先检查网络、DDS、`ROS_DOMAIN_ID` 和防火墙，不要启动录制碰运气。
+Humble client / Jazzy server 的 DDS 发现可能出现 `Failed to parse type hash`、
+`Topic type hash: INVALID` 和未知节点名。缺少哈希不能单独判定数据损坏，
+发现发布者也不能证明已收到数据。检查脚本默认仅提高 Cyclone DDS logger 的门槛至 ERROR，
+减少发现警告；`--verbose` 保留原始警告。此设置仅影响本次检查，不修复缺失的类型哈希，
+不保证跨发行版兼容，也不改变普通 `ros2 topic info` 的行为。
+
+如果有发布者但收不到样本，需核对两端完整 `franka_msgs` 及其依赖消息定义、DDS 和网络。
+从根本上消除跨发行版差异应统一双方 ROS/RMW 版本；本次受限于只修改服务器 `srg/`，
+没有改动系统 ROS、其他工作空间或机器人端环境。
 
 ### 5.3 在 server 启动相机、bridge 和 recorder
 
@@ -237,3 +247,16 @@ PY
 - 部署配置固定关闭力矩记录，防止训练外的推理链路意外改变。
 
 仍需在真实系统验证：两台主机 ROS 时钟偏差、RobotState 实际发布频率、双臂字段顺序、长时间丢帧率、不同负载下 `tau_J`/`tau_ext_hat_filtered` 的物理合理性，以及紧急停止和正常退出流程。本机软件测试不能替代这些硬件验收。
+
+
+### 只读 CLI：过滤缺失哈希警告
+
+```bash
+bash scripts/ros2_topic_readonly.sh info /left/franka_robot_state_broadcaster/robot_state -v
+bash scripts/ros2_topic_readonly.sh echo /left/franka_robot_state_broadcaster/robot_state --field measured_joint_state.effort
+```
+
+此入口只允许 topic info/echo，强制 --no-daemon，echo 默认 --once，并有 12 秒超时。
+仅过滤 Cyclone DDS 的 Failed to parse type hash / USER_DATA '(null)' 警告行，保留其他警告、错误和消息正文。
+添加 --raw-warnings 可显示原始警告。这不修复类型哈希；INVALID / 未知节点名可能仍显示，普通 ros2 命令不受影响。
+检查入口在未设置 CYCLONEDDS_URI 时读取已有的 ~/.config/cyclonedds.xml（不修改该文件），以使用服务器已配置的 DDS 网卡。
