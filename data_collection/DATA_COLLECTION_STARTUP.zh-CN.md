@@ -1,5 +1,7 @@
 # Franka FR3 + GELLO 双机数采启动说明（含可选关节力矩）
 
+最后更新：2026-10-16。
+
 本文对应服务器仓库 `/home/pair1/srg/real-exp-force` 的当前代码。系统由两台机器组成：
 
 - **机器人端 client**：连接 FR3、GELLO 和末端执行器，运行 ROS 2 控制节点。
@@ -10,6 +12,123 @@
 已对照 2026-10-13 上传的实际 client 快照：client 为 Ubuntu 22.04、ROS 2 Humble、Python 3.10，使用 `rmw_cyclonedds_cpp` 和 `ROS_DOMAIN_ID=0`；server 为 ROS 2 Jazzy。client 主仓库基线 `a85aa1c`、GELLO `abe9fcd`、LeRobot `4eecbad` 与本分支的修改基线一致。
 
 > 当前仅完成无机器人软件测试。第一次连接真实 FR3 时必须由熟悉系统的人员在场，并按实验室安全流程执行。
+
+## 0. 首次验证快速启动（双臂 + 二指夹爪 + 力矩）
+
+下面是第一次测试时的最短安全顺序。任何一步失败都先停止，不要跳过检查继续启动。
+
+### 0.1 client：同步个人副本并做离线预检
+
+```bash
+cd /home/landau/srg/franka-real-exp-force
+git status --short
+git fetch origin
+git switch codex/server-schema-v2-fr3-torque-recording
+git pull --ff-only
+git submodule sync
+git submodule update --init gello_software lerobot
+
+cd gello_software/ros2
+source /opt/ros/humble/setup.bash
+source ~/franka_ros2_ws/install/local_setup.bash
+colcon build --packages-select \
+  franka_fr3_arm_controllers \
+  franka_gello_state_publisher \
+  franka_gripper_manager \
+  --symlink-install
+
+cd /home/landau/srg/franka-real-exp-force
+./scripts/check_data_collection_client.sh
+```
+
+`git status --short` 必须为空；如果不为空，不要 reset 或覆盖，先确认改动归属。最后一条命令预期输出 `Static Franka torque interface check: PASS`，且不会连接机器人。
+
+### 0.2 server：同步、构建并做离线预检
+
+```bash
+cd /home/pair1/srg/real-exp-force
+git status --short
+git pull --ff-only github-personal codex/server-schema-v2-fr3-torque-recording
+git submodule update --init gello_software lerobot
+
+cd gello_software/ros2
+source /opt/ros/jazzy/setup.bash
+source ~/franka_ros2_ws/install/local_setup.bash
+colcon build --packages-select franka_lerobot_data_bridge --symlink-install
+
+cd /home/pair1/srg/real-exp-force
+bash scripts/check_data_collection_server.sh
+```
+
+同样要求 `git status --short` 为空。离线预检不会启动机械臂、相机或控制器。
+
+### 0.3 两台机器：检查时钟
+
+分别在 client 和 server 执行：
+
+```bash
+timedatectl status
+chronyc tracking
+```
+
+若两台机器时间未同步，先修复 chrony/NTP；不要通过放宽 torque skew 阈值绕过时钟问题。
+
+### 0.4 client：启动真实机器人控制链路
+
+确认现场无人占用机器人、急停可触达、Desk/FCI 与 GELLO 零位正常后，在 client 执行：
+
+```bash
+cd /home/landau/srg/franka-real-exp-force
+./scripts/start_data_collection_client.sh --duo --gripper
+```
+
+此步骤会连接并控制真实 FR3。保持该终端运行。在另一个 client 终端进行只读检查：
+
+```bash
+cd /home/landau/srg/franka-real-exp-force
+./scripts/check_data_collection_client.sh --duo
+```
+
+必须看到左右 RobotState 的 live PASS 后再继续。
+
+### 0.5 server：只读确认跨机 RobotState
+
+```bash
+cd /home/pair1/srg/real-exp-force
+bash scripts/check_data_collection_server.sh --duo --timeout 10
+```
+
+必须实际收到左右两臂消息，并确认 `measured_joint_state.effort` 与 `tau_ext_hat_filtered.effort` 各为 7 个有限值。只有发现 publisher、但没有收到样本，不算通过。
+
+### 0.6 server：启动带力矩的录制
+
+先与其他使用者确认 RealSense、端口和 GPU 没有被占用，再执行：
+
+```bash
+cd /home/pair1/srg/real-exp-force
+./scripts/start_data_collection_server.sh \
+  --duo --gripper \
+  --record-torque --record \
+  --local-dir /home/pair1/srg/datasets/fr3_torque_test \
+  --repo-id local/fr3_torque_test \
+  --bridge-host 192.168.50.13 \
+  --ros-distro jazzy
+```
+
+第一次只录制一个短的静止 episode：按 `s` 开始/结束，按 `e` 保存，按 `q` 退出。若 bridge 持续报告 missing、stale、future timestamp 或 skew，立即停止本次录制并先排查同步问题。
+
+### 0.7 server：检查保存结果
+
+```bash
+test -f /home/pair1/srg/datasets/fr3_torque_test/meta/real_exp_torque_config.json
+cat /home/pair1/srg/datasets/fr3_torque_test/meta/real_exp_torque_config.json
+```
+
+随后按第 7 节的 Python 命令重新读取首帧。双臂数据必须为 `float32`、shape `(14,)`，顺序为左 7 维后右 7 维，单位为 `N.m`。
+
+### 0.8 停止
+
+先在 server recorder 中保存或丢弃 episode 并按 `q`，再停止 server launcher，最后按原实验流程停止 client 控制链路并退出 FCI。
 
 ## 1. 数据内容
 
