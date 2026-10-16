@@ -38,6 +38,7 @@ def generate_bridge_node(context):
     camera_cache_port = int(LaunchConfiguration("camera_cache_port").perform(context))
     include_gripper_text = LaunchConfiguration("include_gripper").perform(context).strip().lower()
     include_hand_text = LaunchConfiguration("include_hand").perform(context).strip().lower()
+    record_torque_text = LaunchConfiguration("record_torque").perform(context).strip().lower()
     arm_mode = LaunchConfiguration("arm_mode").perform(context).strip().lower()
     state_action_mode = LaunchConfiguration("state_action_mode").perform(context).strip().lower()
     hand_telemetry_host = LaunchConfiguration("hand_telemetry_host").perform(context)
@@ -59,6 +60,8 @@ def generate_bridge_node(context):
         overrides["include_gripper"] = include_gripper_text == "true"
     if include_hand_text in {"true", "false"}:
         overrides["include_hand"] = include_hand_text == "true"
+    if record_torque_text in {"true", "false"}:
+        overrides["record_torque"] = record_torque_text == "true"
     if arm_mode:
         overrides["arm_mode"] = arm_mode
     if state_action_mode in {"joint", "end_effector"}:
@@ -127,6 +130,11 @@ def generate_launch_description():
                 "include_hand",
                 default_value="",
                 description="Override whether Wuji hand telemetry is included; empty keeps YAML value.",
+            ),
+            DeclareLaunchArgument(
+                "record_torque",
+                default_value="",
+                description="Override optional collection-only joint-torque recording; empty keeps YAML value.",
             ),
             DeclareLaunchArgument(
                 "arm_mode",
